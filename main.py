@@ -4,11 +4,13 @@ from datetime import datetime
 import threading
 from flask import Flask, request, jsonify
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # Токен бота
 BOT_TOKEN = "8738075651:AAFlih0KCqso9re1_40N0jPq7AgCveOZXUE"
 DEFAULT_BACKUP_NAME = "survival_budget_backup.json"
 BACKUPS_DIR = "backups"
+MAX_BACKUPS = 5  # Храним максимум 5 файлов для каждого юзера
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -17,6 +19,45 @@ def ensure_backups_dir():
     """Гарантирует существование базовой папки для бэкапов."""
     if not os.path.exists(BACKUPS_DIR):
         os.makedirs(BACKUPS_DIR)
+
+def get_user_backups(user_id):
+    """Возвращает отсортированный по времени список бэкапов пользователя."""
+    user_dir = os.path.join(BACKUPS_DIR, str(user_id))
+    if not os.path.exists(user_dir):
+        return []
+    
+    files = os.listdir(user_dir)
+    # Фильтруем только наши файлы с маской даты
+    backup_files = [
+        f for f in files 
+        if re.match(r"survival_budget_backup_\d{8}_\d{6}\.json", f)
+    ]
+    # Сортируем: сначала самые свежие (по времени изменения файла)
+    backup_files.sort(key=lambda x: os.path.getmtime(os.path.join(user_dir, x)), reverse=True)
+    return backup_files
+
+def clean_old_backups(user_id):
+    """Удаляет старые бэкапы, оставляя только MAX_BACKUPS штук."""
+    user_dir = os.path.join(BACKUPS_DIR, str(user_id))
+    backups = get_user_backups(user_id)
+    
+    if len(backups) > MAX_BACKUPS:
+        old_backups = backups[MAX_BACKUPS:]
+        for old_file in old_backups:
+            try:
+                os.remove(os.path.join(user_dir, old_file))
+            except Exception as e:
+                print(f"Ошибка удаления старого файла {old_file}: {e}")
+
+def parse_datetime_from_filename(filename):
+    """Вытаскивает красивую дату и время из имени файла."""
+    match = re.search(r"(\d{8})_(\d{6})", filename)
+    if match:
+        date_part, time_part = match.groups()
+        # Превращаем из 20260527_183000 в объект даты
+        dt = datetime.strptime(f"{date_part}{time_part}", "%Y%m%d%H%M%S")
+        return dt.strftime("%d.%m.%Y %H:%M")
+    return "Неизвестная дата"
 
 @app.route('/')
 def home():
@@ -39,19 +80,18 @@ def upload_file_from_app():
     if not os.path.exists(user_dir):
         os.makedirs(user_dir)
 
-    # Формируем имя файла с датой
+    # Формируем уникальное имя с таймстампом
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     new_file_name = f"survival_budget_backup_{now_str}.json"
     file_path = os.path.join(user_dir, new_file_name)
 
     try:
-        # Сохраняем файл на сервере
         file.save(file_path)
+        clean_old_backups(user_id)  # Чистим хвосты, если файлов больше 5
         
-        # Отправляем пользователю уведомление в Telegram, что бэкап долетел до сервера
         bot.send_message(
             chat_id=user_id, 
-            text=f"🔄 *Облако:* Новая резервная копия из приложения успешно сохранена на сервере!",
+            text="🔄 *Облако:* Резервная копия успешно создана и сохранена в архив сервера!",
             parse_mode='Markdown'
         )
         return jsonify({"status": "success", "message": "Backup saved successfully"}), 200
@@ -61,52 +101,68 @@ def upload_file_from_app():
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
-        "Привет! Я бот для управления резервными копиями приложения Survival Budget.\n\n"
-        "💾 *Как сохранить бэкап:*\n"
-        "Просто нажми кнопку «Сохранить бэкап в облако TG» внутри приложения.\n\n"
-        "📥 *Как восстановить бэкап:*\n"
-        "Отправь команду /load, и я пришлю тебе самый свежий файл."
+        "Привет! Я официальный бот архива резервных копий *Survival Budget*.\n\n"
+        "💾 *Сохранение:*\n"
+        "Просто нажми кнопку «Сохранить бэкап в облако TG» в приложении.\n\n"
+        "📥 *Восстановление:*\n"
+        "Отправь команду /load, и я выведу список доступных точек восстановления."
     )
     bot.reply_to(message, welcome_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['load'])
-def load_backup(message):
-    """Выдача пользователю самой последней версии бэкапа."""
+def load_backup_list(message):
+    """Вывод списка кнопок с доступными бэкапами."""
     user_id = str(message.from_user.id)
-    user_dir = os.path.join(BACKUPS_DIR, user_id)
+    backups = get_user_backups(user_id)
     
-    if not os.path.exists(user_dir) or not os.listdir(user_dir):
-        bot.reply_to(message, "У вас ещё нет сохранённых копий.")
+    if not backups:
+        bot.reply_to(message, "У вас ещё нет сохранённых копий в облаке.")
+        return
+
+    markup = InlineKeyboardMarkup()
+    for filename in backups:
+        pretty_date = parse_datetime_from_filename(filename)
+        # В callback_data зашиваем имя файла, чтобы понять, какой именно качать
+        # Лимит на callback_data в ТГ - 64 байта, наше имя файла туда влезает без проблем
+        button = InlineKeyboardButton(
+            text=f"📅 {pretty_date}", 
+            callback_data=f"download:{filename}"
+        )
+        markup.add(button)
+
+    bot.send_message(
+        message.chat.id, 
+        "📋 *Выберите точку восстановления из архива:*", 
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('download:'))
+def handle_backup_download(call):
+    """Обработка нажатия на кнопку с датой бэкапа."""
+    user_id = str(call.from_user.id)
+    filename = call.data.split('download:')[1]
+    file_path = os.path.join(BACKUPS_DIR, user_id, filename)
+
+    if not os.path.exists(file_path):
+        bot.answer_callback_query(call.id, text="Ошибка: файл не найден на сервере!", show_alert=True)
         return
 
     try:
-        files = os.listdir(user_dir)
-        backup_files = [
-            f for f in files 
-            if re.match(r"survival_budget_backup_\d{8}_\d{6}\.json", f)
-        ]
-        
-        if not backup_files:
-            bot.reply_to(message, "У вас ещё нет сохранённых копий.")
-            return
-            
-        backup_files.sort(key=lambda x: os.path.getmtime(os.path.join(user_dir, x)), reverse=True)
-        latest_file_name = backup_files[0]
-        latest_file_path = os.path.join(user_dir, latest_file_name)
-        
-        with open(latest_file_path, 'rb') as backup_file:
+        bot.answer_callback_query(call.id, text="Отправляю файл...")
+        with open(file_path, 'rb') as backup_file:
             bot.send_document(
-                message.chat.id, 
+                call.message.chat.id, 
                 backup_file, 
                 visible_file_name=DEFAULT_BACKUP_NAME,
-                caption="Ваша последняя резервная копия из облака."
+                caption=f"📦 Восстановление от {parse_datetime_from_filename(filename)}."
             )
     except Exception as e:
-        bot.reply_to(message, f"Произошла ошибка при отправке файла: {str(e)}")
+        bot.send_message(call.message.chat.id, f"Ошибка при отправке файла: {str(e)}")
 
 def run_bot():
     ensure_backups_dir()
-    print("Бот Survival Budget запущен...")
+    print("Бот Survival Budget успешно запущен...")
     bot.infinity_polling()
 
 if __name__ == '__main__':
