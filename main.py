@@ -27,12 +27,10 @@ def get_user_backups(user_id):
         return []
     
     files = os.listdir(user_dir)
-    # Фильтруем только наши файлы с маской даты
     backup_files = [
         f for f in files 
         if re.match(r"survival_budget_backup_\d{8}_\d{6}\.json", f)
     ]
-    # Сортируем: сначала самые свежие (по времени изменения файла)
     backup_files.sort(key=lambda x: os.path.getmtime(os.path.join(user_dir, x)), reverse=True)
     return backup_files
 
@@ -54,7 +52,6 @@ def parse_datetime_from_filename(filename):
     match = re.search(r"(\d{8})_(\d{6})", filename)
     if match:
         date_part, time_part = match.groups()
-        # Превращаем из 20260527_183000 в объект даты
         dt = datetime.strptime(f"{date_part}{time_part}", "%Y%m%d%H%M%S")
         return dt.strftime("%d.%m.%Y %H:%M")
     return "Неизвестная дата"
@@ -80,14 +77,13 @@ def upload_file_from_app():
     if not os.path.exists(user_dir):
         os.makedirs(user_dir)
 
-    # Формируем уникальное имя с таймстампом
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     new_file_name = f"survival_budget_backup_{now_str}.json"
     file_path = os.path.join(user_dir, new_file_name)
 
     try:
         file.save(file_path)
-        clean_old_backups(user_id)  # Чистим хвосты, если файлов больше 5
+        clean_old_backups(user_id)
         
         bot.send_message(
             chat_id=user_id, 
@@ -105,7 +101,9 @@ def send_welcome(message):
         "💾 *Сохранение:*\n"
         "Просто нажми кнопку «Сохранить бэкап в облако TG» в приложении.\n\n"
         "📥 *Восстановление:*\n"
-        "Отправь команду /load, и я выведу список доступных точек восстановления."
+        "Отправь команду /load, и я выведу список доступных точек восстановления.\n\n"
+        "🗑️ *Очистка:*\n"
+        "Отправь команду /clear, чтобы навсегда удалить все свои бэкапы с сервера."
     )
     bot.reply_to(message, welcome_text, parse_mode='Markdown')
 
@@ -122,8 +120,6 @@ def load_backup_list(message):
     markup = InlineKeyboardMarkup()
     for filename in backups:
         pretty_date = parse_datetime_from_filename(filename)
-        # В callback_data зашиваем имя файла, чтобы понять, какой именно качать
-        # Лимит на callback_data в ТГ - 64 байта, наше имя файла туда влезает без проблем
         button = InlineKeyboardButton(
             text=f"📅 {pretty_date}", 
             callback_data=f"download:{filename}"
@@ -136,6 +132,29 @@ def load_backup_list(message):
         reply_markup=markup,
         parse_mode='Markdown'
     )
+
+@bot.message_handler(commands=['clear'])
+def clear_backups(message):
+    """Полное удаление всех бэкапов пользователя с сервера."""
+    user_id = str(message.from_user.id)
+    user_dir = os.path.join(BACKUPS_DIR, user_id)
+    
+    if not os.path.exists(user_dir) or not os.listdir(user_dir):
+        bot.reply_to(message, "У вас и так нет сохранённых копий в облаке.")
+        return
+
+    try:
+        for filename in os.listdir(user_dir):
+            os.remove(os.path.join(user_dir, filename))
+        os.rmdir(user_dir)
+        
+        bot.reply_to(
+            message, 
+            "🗑️ *Облако очищено:* Все ваши резервные копии были навсегда удалены с сервера!", 
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка при очистке облака: {str(e)}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('download:'))
 def handle_backup_download(call):
