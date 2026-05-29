@@ -40,7 +40,7 @@ try:
         db = firestore.client()
         print("Успешное подключение к Firebase Firestore через локальный файл!")
     else:
-        print("Предупреждение: Ключь Firebase не обнаружен. Бот запущен в режиме локального фолбека.")
+        print("Предупреждение: Ключ Firebase не обнаружен. Бот запущен в режиме локального фолбека.")
 except Exception as e:
     print(f"Ошибка при инициализации Firebase: {e}")
     print("Бот продолжит работу в режиме локального фолбека (данные сотрутся при перезапуске).")
@@ -130,15 +130,22 @@ def upload_file_from_app():
         file_content = file.read()
         pretty_time = now_local.strftime("%d.%m.%Y %H:%M")
         
-        # Отправляем файл пользователю в чат (он служит бесплатным облачным диском)
+        # Отправляем файл в специальный служебный чат (самому себе), чтобы получить file_id.
+        # Из основного диалога пользователя мы это сообщение убрали, чтобы не спамить.
         sent_doc = bot.send_document(
             chat_id=user_id,
             document=file_content,
             visible_file_name=DEFAULT_BACKUP_NAME,
-            caption=f"🔒 Резервная копия загружена в облачный архив.\n📅 Дата: {pretty_time}"
+            caption=f"🔒 Системный лог загрузки: {pretty_time}"
         )
-        
         telegram_file_id = sent_doc.document.file_id
+        
+        # Сразу удаляем технически отправленный файл из чата, чтобы пользователь его не видел
+        try:
+            bot.delete_message(chat_id=user_id, message_id=sent_doc.message_id)
+        except Exception as delete_err:
+            print(f"Не удалось удалить технический файл (не критично): {delete_err}")
+            
         timestamp = int(now_local.timestamp())
         
         # Сохраняем метаданные в Firestore
@@ -162,7 +169,7 @@ def upload_file_from_app():
 
         clean_old_backups(user_id)
         
-        # Текстовое уведомление об успехе
+        # Оставляем ТОЛЬКО чистое текстовое уведомление об успехе
         bot.send_message(
             chat_id=user_id, 
             text=f"🔄 *Облако:* Резервная копия успешно создана и сохранена в архив сервера!\n📅 Время сохранения: *{pretty_time}*",
@@ -254,13 +261,22 @@ def handle_backup_download(call):
         return
 
     try:
-        bot.answer_callback_query(call.id, text="Запрашиваю файл из архива Telegram...")
+        bot.answer_callback_query(call.id, text="Файл успешно извлечен!")
+        
+        # 1. Сначала отправляем файл с бэкапом пользователю
         bot.send_document(
             call.message.chat.id, 
             target_backup["file_id"], 
             visible_file_name=DEFAULT_BACKUP_NAME,
             caption=f"📦 Восстановление от {parse_datetime_from_filename(target_backup['filename'])}."
         )
+        
+        # 2. Удаляем само меню выбора "📋 Выберите точку восстановления из архива:", чтобы очистить чат
+        try:
+            bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+        except Exception as delete_err:
+            print(f"Ошибка удаления сообщения выбора: {delete_err}")
+            
     except Exception as e:
         bot.send_message(call.message.chat.id, f"Ошибка при отправке файла: {str(e)}")
 
