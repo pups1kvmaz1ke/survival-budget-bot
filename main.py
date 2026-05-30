@@ -5,7 +5,6 @@ import threading
 from flask import Flask, request, jsonify
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import pytz
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -13,9 +12,6 @@ from firebase_admin import credentials, firestore
 BOT_TOKEN = "8738075651:AAFlih0KCqso9re1_40N0jPq7AgCveOZXUE"
 DEFAULT_BACKUP_NAME = "survival_budget_backup.json"
 MAX_BACKUPS = 5  # Храним максимум 5 файлов для каждого юзера
-
-# Настройка часового пояса (по умолчанию Екатеринбург, UTC+5)
-BOT_TIMEZONE = pytz.timezone('Asia/Yekaterinburg')
 
 # Инициализация бота
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -49,7 +45,7 @@ except Exception as e:
 local_db_fallback = {}
 
 def get_user_backups_ref(user_id):
-    """Возвращает правильную ссылку на коллекцию бэкапов пользователя в Firestore."""
+    """Возвращает ссылку на коллекцию бэкапов пользователя в Firestore."""
     if db:
         return db.collection('artifacts').document(APP_ID).collection('public_data').document(f'user_{user_id}').collection('backups')
     return None
@@ -111,7 +107,7 @@ def home():
 
 @app.route('/upload', methods=['POST'])
 def upload_file_from_app():
-    """Прием бэкапа напрямую из Android-приложения."""
+    """Прием бэкапа напрямую из Android-приложения с учетом времени клиента."""
     if 'file' not in request.files or 'user_id' not in request.form:
         return jsonify({"error": "Missing file or user_id"}), 400
         
@@ -121,17 +117,30 @@ def upload_file_from_app():
     if file.filename != DEFAULT_BACKUP_NAME:
         return jsonify({"error": f"Invalid file name. Expected {DEFAULT_BACKUP_NAME}"}), 400
 
-    # Получаем текущее время в локальной временной зоне бота (Екатеринбург)
-    now_local = datetime.now(BOT_TIMEZONE)
-    now_str = now_local.strftime("%Y%m%d_%H%M%S")
-    new_file_name = f"survival_budget_backup_{now_str}.json"
+    # 1. Принимаем поле 'client_time' из запроса приложения
+    client_time = request.form.get('client_time')
+    
+    if client_time:
+        try:
+            # Парсим полученное время телефона обратно в объект datetime
+            now_dt = datetime.strptime(client_time, "%Y%m%d_%H%M%S")
+        except ValueError:
+            # Фолбек на случай непредвиденных проблем с форматом строки
+            now_dt = datetime.utcnow()
+            client_time = now_dt.strftime("%Y%m%d_%H%M%S")
+    else:
+        # Если клиент старой версии или не передал время устройства, используем UTC
+        now_dt = datetime.utcnow()
+        client_time = now_dt.strftime("%Y%m%d_%H%M%S")
+
+    # Формируем имя файла с использованием времени клиента
+    new_file_name = f"survival_budget_backup_{client_time}.json"
 
     try:
         file_content = file.read()
-        pretty_time = now_local.strftime("%d.%m.%Y %H:%M")
+        pretty_time = now_dt.strftime("%d.%m.%Y %H:%M")
         
-        # Отправляем файл в специальный служебный чат (самому себе), чтобы получить file_id.
-        # Из основного диалога пользователя мы это сообщение убрали, чтобы не спамить.
+        # Отправляем файл в чат, чтобы сгенерировать стабильный Telegram file_id
         sent_doc = bot.send_document(
             chat_id=user_id,
             document=file_content,
@@ -140,36 +149,36 @@ def upload_file_from_app():
         )
         telegram_file_id = sent_doc.document.file_id
         
-        # Сразу удаляем технически отправленный файл из чата, чтобы пользователь его не видел
+        # Сразу удаляем системный документ из чата пользователя для чистоты интерфейса
         try:
             bot.delete_message(chat_id=user_id, message_id=sent_doc.message_id)
         except Exception as delete_err:
             print(f"Не удалось удалить технический файл (не критично): {delete_err}")
             
-        timestamp = int(now_local.timestamp())
+        firebase_timestamp = int(now_dt.timestamp())
         
         # Сохраняем метаданные в Firestore
         if db:
             backups_ref = get_user_backups_ref(user_id)
-            doc_id = f"backup_{now_str}"
+            doc_id = f"backup_{client_time}"
             backups_ref.document(doc_id).set({
                 "file_id": telegram_file_id,
                 "filename": new_file_name,
-                "timestamp": timestamp
+                "timestamp": firebase_timestamp
             })
         else:
             if user_id not in local_db_fallback:
                 local_db_fallback[user_id] = []
             local_db_fallback[user_id].insert(0, {
-                "id": f"backup_{now_str}",
+                "id": f"backup_{client_time}",
                 "file_id": telegram_file_id,
                 "filename": new_file_name,
-                "timestamp": timestamp
+                "timestamp": firebase_timestamp
             })
 
         clean_old_backups(user_id)
         
-        # Оставляем ТОЛЬКО чистое текстовое уведомление об успехе
+        # Оставляем только чистое текстовое уведомление (время подстроится под пояс юзера)
         bot.send_message(
             chat_id=user_id, 
             text=f"🔄 *Облако:* Резервная копия успешно создана и сохранена в архив сервера!\n📅 Время сохранения: *{pretty_time}*",
@@ -263,7 +272,7 @@ def handle_backup_download(call):
     try:
         bot.answer_callback_query(call.id, text="Файл успешно извлечен!")
         
-        # 1. Сначала отправляем файл с бэкапом пользователю
+        # Отправляем файл резервной копии пользователю в чат
         bot.send_document(
             call.message.chat.id, 
             target_backup["file_id"], 
@@ -271,7 +280,7 @@ def handle_backup_download(call):
             caption=f"📦 Восстановление от {parse_datetime_from_filename(target_backup['filename'])}."
         )
         
-        # 2. Удаляем само меню выбора "📋 Выберите точку восстановления из архива:", чтобы очистить чат
+        # Удаляем само меню выбора, чтобы не засорять историю сообщений
         try:
             bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
         except Exception as delete_err:
