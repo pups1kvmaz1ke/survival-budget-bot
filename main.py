@@ -9,7 +9,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # Токен бота
-BOT_TOKEN = "8738075651:AAFlih0KCqso9re1_40N0jPq7AgCveOZXUE"
+BOT_TOKEN = "8738075651:AAFw0UW_2hLhaMYpYROfGYhVq2WyKoAcYsc"
 DEFAULT_BACKUP_NAME = "survival_budget_backup.json"
 MAX_BACKUPS = 5  # Храним максимум 5 файлов для каждого юзера
 
